@@ -1,0 +1,8 @@
+{application, red_top, [ {description,  "red_top"}
+                       , {vsn,          ""}
+                       , {modules,      [red_top, red_top_sup, red_top_app]}
+                       , {registered,   []}
+                       , {mod,          {red_top_app,[]}}
+                       , {env,          []}
+                       , {applications, [kernel,stdlib]}
+                       ]}.

@@ -1,0 +1,9 @@
+.#*
+\#*
+*~
+/*.plt
+/.eunit/
+/.rebar
+/deps/
+/ebin/
+*beam
