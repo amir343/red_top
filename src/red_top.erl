@@ -40,6 +40,9 @@
 -define(MAX_NR_WORKERS,  5).
 %% Maximum number of workers allowed for querying this server.
 
+-define(SUM, 'SUM').
+%% Special Key to hold calculated data to be used when querying the server.
+
 %%%_* Records ===============================================================
 
 -record(state, { sample_interval = ?SAMPLE_INTERVAL,
@@ -159,8 +162,7 @@ terminate(_Reason, _State) ->
 %%% Internal Functions
 %%% -------------------------------------------------------------------------
 
--spec worker(any(), pid(), ets:tab()) ->
-                term() | {unrecognized_request, any()}.
+-spec worker(any(), any(), ets:tab()) -> any().
 %% Start a worker with respective request, caller's pid and table name
 worker(Request, From, Table) ->
   Result =
@@ -172,7 +174,7 @@ worker(Request, From, Table) ->
   gen_server:reply(From, Result).
 
 -spec handle_worker_exit(pid(), reference(), [worker()], state()) ->
-                            {pid(), [worker()]}.
+                            {any(), [worker()]}.
 %% This function is called whenever a worker exits as a mean of clening up
 %% any resources that are being used by the worker.
 %%
@@ -203,25 +205,41 @@ handle_worker_exit(Pid, Ref, Workers, State) ->
 %% process and also it becomes easier with process churn.
 sample(State=#state{table = OldTable}) ->
   NewTable = create_table(),
-  lists:foreach(
-    fun({P, PidInfo}) ->
-        NewR = reductions(PidInfo),
-        GL = get_group_leader(PidInfo),
-        case ets:lookup(OldTable, P) of
-          [] ->
-            RegisteredNames = registered_name(PidInfo),
-            ets:insert(NewTable,
-                       { P
-                       , app_name(P, GL, RegisteredNames)
-                       , RegisteredNames
-                       , {0, NewR}});
-          [{Pid, App, RN, {_, R2}}] ->
-            ets:insert(NewTable, {Pid, App, RN, {R2, NewR}})
-        end
-    end, process_infos()),
+  NonTransientReds =
+    lists:foldl(
+      fun({P, PidInfo}, TR) ->
+          NewR = reductions(PidInfo),
+          GL = get_group_leader(PidInfo),
+          case ets:lookup(OldTable, P) of
+            [] ->
+              RegisteredNames = registered_name(PidInfo),
+              ets:insert(NewTable,
+                         { P
+                         , app_name(P, GL, RegisteredNames)
+                         , RegisteredNames
+                         , {0, NewR}}),
+              NewR + TR;
+            [{Pid, App, RN, {_, R2}}] ->
+              ets:insert(NewTable, {Pid, App, RN, {R2, NewR}}),
+              NewR - R2 + TR
+          end
+      end, 0, process_infos()),
+  %% Store the total reductions to be used later
+  {NewTotal, _} = statistics(reductions),
+  TotalReductions =
+    case ets:lookup(OldTable, ?SUM) of
+      []                         -> NonTransientReds;
+      [{_, _, {OldTotal, _}, _}] -> max(NewTotal - OldTotal, NonTransientReds)
+    end,
+  TransientReductions = TotalReductions - NonTransientReds,
+  ets:insert( NewTable
+            , { ?SUM
+              , 'TransientReductions'
+              , {NewTotal, TotalReductions}, {0, TransientReductions}}),
   NewState = State#state{table = NewTable},
   delete_ets_if_possible(OldTable, NewState),
   NewState.
+
 
 -spec delete_ets_if_possible(ets:tab(), state()) -> boolean().
 %% Don't delete the table if:
@@ -262,12 +280,9 @@ get_latest_sample_for_app(AppName, Table) ->
 %% * `all': return applications' cpu utilisation with also their processes and
 %%   their relative cpu utilisations.
 get_latest_sample(Mode, Table) ->
-  TotalReductions =
-    ets:foldl(
-      fun({_, _, _, {R1, R2}}, TotalRs) ->
-          TotalRs + R2 - R1
-      end, 0, Table),
+  [{?SUM, _, {_, TotalReductions}, _}] = ets:lookup(Table, ?SUM),
   calc_reductions(Mode, Table, TotalReductions).
+
 
 -spec calc_reductions(all | top_level, ets:tab(), pos_integer()) ->
                          [ { app_name()
@@ -353,14 +368,11 @@ app_name(Pid, GroupLeader, RegisteredNames) ->
     undefined -> pid_to_name(Pid, RegisteredNames)
   end.
 
-pid_to_name(Pid, undefined) ->
-  Pid;
-pid_to_name(Pid, []) ->
-  Pid;
-pid_to_name(_, [H | _]) ->
-  H;
-pid_to_name(_, Name) ->
-  Name.
+pid_to_name(?SUM, _)        -> transient;
+pid_to_name(Pid, undefined) -> Pid;
+pid_to_name(Pid, [])        -> Pid;
+pid_to_name(_, [H | _])     -> H;
+pid_to_name(_, Name)        -> Name.
 
 create_table() ->
   ets:new(?TABLE, [protected, set]).
